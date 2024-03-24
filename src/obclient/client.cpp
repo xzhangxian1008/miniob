@@ -13,7 +13,9 @@ See the Mulan PSL v2 for more details. */
 //
 
 #include <arpa/inet.h>
+#include <cstdio>
 #include <errno.h>
+#include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -24,8 +26,10 @@ See the Mulan PSL v2 for more details. */
 #include <sys/types.h>
 #include <sys/un.h>
 #include <termios.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 #include "common/defs.h"
 #include "common/lang/string.h"
@@ -145,6 +149,109 @@ int init_tcp_sock(const char *server_host, int server_port)
   return sockfd;
 }
 
+constexpr int insert_num = 1000000;
+
+void recv(int sockfd, char *buf) {
+  while (true) {
+    int len = recv(sockfd, buf, MAX_MEM_BUFFER_SIZE, 0);
+    if (len <= 0) {
+      break;
+    }
+    bool msg_end = false;
+    for (int i = 0; i < len; i++) {
+      if (buf[i] == 0) {
+        msg_end = true;
+        break;
+      }
+    }
+    if (msg_end) {
+      break;
+    }
+
+    memset(buf, 0, MAX_MEM_BUFFER_SIZE);
+  }
+  memset(buf, 0, MAX_MEM_BUFFER_SIZE);
+}
+
+std::string c_content("111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111");
+std::string pad_content("111111111111111111111111111111111111111111111111111111111111");
+
+void insert(int sockfd, char* table_name, int idx, char *recv_buf) {
+  char buf[300];
+  auto len = std::sprintf(buf, "insert into %s values (%d, %.1f, '%s', '%s');", table_name, idx, float(idx), c_content.c_str(), pad_content.c_str());
+  if (len <= 0) {
+    std::cout << "sprintf fails in insert function\n";
+    exit(-1);
+  }
+
+  if (write(sockfd, buf, len + 1) == -1) {
+    fprintf(stderr, "send error: %d:%s \n", errno, strerror(errno));
+    exit(-1);
+  }
+
+  recv(sockfd, recv_buf);
+}
+
+std::mutex lock;
+
+void execute_insert(int thread_num) {
+  char table_name[50];
+  sprintf(table_name, "sbtest%d", thread_num);
+  
+  char create_sql_str[200];
+  auto create_tb_str_len = std::sprintf(create_sql_str, "CREATE TABLE %s(k INT,f FLOAT,c CHAR(120),pad CHAR(60));", table_name);
+  if (create_tb_str_len < 0) {
+    std::cout << "sprintf fails\n";
+    exit(-1);
+  }
+
+  const char *server_host = "127.0.0.1";
+  int server_port = PORT_DEFAULT;
+  
+  // create socket
+  int sockfd = init_tcp_sock(server_host, server_port);
+  if (sockfd < 0) {
+    std::cout << "Faile to create tcp socket\n";
+    return;
+  }
+
+  char buf[MAX_MEM_BUFFER_SIZE];
+
+  // miniob will crash when concurrently creating tables. So we need lock here.
+  {
+      std::lock_guard<std::mutex> lk_guard(lock);
+      if (write(sockfd, create_sql_str, create_tb_str_len + 1) == -1) {
+        fprintf(stderr, "send error: %d:%s \n", errno, strerror(errno));
+        exit(1);
+      }
+
+      char buf[MAX_MEM_BUFFER_SIZE];
+      recv(sockfd, buf);
+  }
+
+  for (int i = 0; i < insert_num; i++) {
+    insert(sockfd, table_name, i, buf);
+    if ((i % 1000) == 0) {
+      char info[100];
+      std::sprintf(info, "%d rows have been inserted in %d thread\n", (i+1), thread_num);
+      std::cout << info;
+    }
+  }
+}
+
+void execute_bench() {
+  int thread_num = 10;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < thread_num; i++) {
+    threads.push_back(std::thread(execute_insert, i));
+  }
+
+  for (auto& thd : threads) {
+    thd.join();
+  }
+  std::cout << "bench finished." << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
   const char  *unix_socket_path = nullptr;
@@ -152,12 +259,19 @@ int main(int argc, char *argv[])
   int          server_port      = PORT_DEFAULT;
   int          opt;
   extern char *optarg;
-  while ((opt = getopt(argc, argv, "s:h:p:")) > 0) {
+  bool is_bench = false;
+  while ((opt = getopt(argc, argv, "s:h:p:b")) > 0) {
     switch (opt) {
       case 's': unix_socket_path = optarg; break;
       case 'p': server_port = atoi(optarg); break;
       case 'h': server_host = optarg; break;
+      case 'b': is_bench = true;
     }
+  }
+
+  if (is_bench) {
+    execute_bench();
+    return 0;
   }
 
   const char *prompt_str = "miniob > ";
